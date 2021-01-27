@@ -3,6 +3,8 @@ library hydrated;
 import 'dart:async';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:rxdart/rxdart.dart';
+import 'package:rxdart/src/transformers/start_with.dart';
+import 'package:rxdart/src/transformers/start_with_error.dart';
 
 /// A [Subject] that automatically persists its values and hydrates on creation.
 ///
@@ -84,7 +86,7 @@ class HydratedSubject<T> extends Subject<T> implements ValueStream<T> {
       sync: sync,
     );
 
-    final wrapper = new _Wrapper<T>(seedValue);
+    final wrapper = new _Wrapper<T>.seeded(seedValue);
 
     return new HydratedSubject<T>._(
         key,
@@ -93,13 +95,56 @@ class HydratedSubject<T> extends Subject<T> implements ValueStream<T> {
         persist,
         onHydrate,
         controller,
-        Rx.defer<T>(
-            () => wrapper.latestValue == null
-                ? controller.stream
-                : controller.stream
-                    .startWith(wrapper.latestValue),
-            reusable: true),
+        Rx.defer<T>(_deferStream(wrapper, controller, sync)),
         wrapper);
+  }
+
+  static Stream<T> Function() _deferStream<T>(
+          _Wrapper<T> wrapper, StreamController<T> controller, bool sync) =>
+      () {
+        if (wrapper.latestIsError) {
+          final errorAndStackTrace = wrapper.latestErrorAndStackTrace;
+
+          return controller.stream.transform(
+            StartWithErrorStreamTransformer(
+                errorAndStackTrace.error, errorAndStackTrace.stackTrace),
+          );
+        } else if (wrapper.latestIsValue) {
+          return controller.stream
+              .transform(StartWithStreamTransformer(wrapper.latestValue));
+        }
+        return controller.stream;
+      };
+
+  @override
+  void onAddError(Object error, [StackTrace stackTrace]) =>
+      _wrapper.setError(error, stackTrace);
+
+  @override
+  ValueStream<T> handleError(Function onError,
+          {bool Function(Object error) test}) =>
+      _forwardBehaviorSubject<T>((s) => s.handleError(onError, test: test));
+
+  ValueStream<R> _forwardBehaviorSubject<R>(
+      Stream<R> Function(Stream<T> s) transformerStream) {
+    ArgumentError.checkNotNull(transformerStream, 'transformerStream');
+
+    BehaviorSubject<R> subject;
+    StreamSubscription<R> subscription;
+
+    final onListen = () => subscription = transformerStream(this).listen(
+          subject.add,
+          onError: subject.addError,
+          onDone: subject.close,
+        );
+
+    final onCancel = () => subscription.cancel();
+    subject = createForwardingSubject(
+      onListen: onListen,
+      onCancel: onCancel,
+      sync: true,
+    );
+    return subject;
   }
 
   @override
@@ -128,7 +173,7 @@ class HydratedSubject<T> extends Subject<T> implements ValueStream<T> {
     final prefs = await SharedPreferences.getInstance();
 
     var val;
-    
+
     if (this._hydrate != null)
       val = this._hydrate(prefs.getString(this._key));
     else if (T == int)
@@ -180,10 +225,53 @@ class HydratedSubject<T> extends Subject<T> implements ValueStream<T> {
 
   /// A unique key that references a storage container for a value persisted on the device.
   String get key => this._key;
+
+  @override
+  Subject<R> createForwardingSubject<R>(
+      {void Function() onListen, void Function() onCancel, bool sync = false}) {
+    return HydratedSubject(
+      key,
+      onListen: onListen,
+      onCancel: onCancel,
+      onHydrate: _onHydrate,
+      sync: sync,
+    );
+  }
+
+  @override
+  ErrorAndStackTrace get errorAndStackTrace =>
+      _wrapper.latestErrorAndStackTrace;
+
+  @override
+  bool get hasError => _wrapper.latestIsError;
 }
 
 class _Wrapper<T> {
   T latestValue;
+  ErrorAndStackTrace latestErrorAndStackTrace;
 
-  _Wrapper(this.latestValue);
+  bool latestIsValue = false, latestIsError = false;
+
+  /// Non-seeded constructor
+  _Wrapper();
+
+  _Wrapper.seeded(this.latestValue) : latestIsValue = true;
+
+  void setValue(T event) {
+    latestIsValue = true;
+    latestIsError = false;
+
+    latestValue = event;
+
+    latestErrorAndStackTrace = null;
+  }
+
+  void setError(Object error, [StackTrace stackTrace]) {
+    latestIsValue = false;
+    latestIsError = true;
+
+    latestValue = null;
+
+    latestErrorAndStackTrace = ErrorAndStackTrace(error, stackTrace);
+  }
 }
